@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""gifsnap: press a shortcut, drag a region, get a GIF.
+
+Run with no arguments to record. Drag a region (or click a window), and it
+records that area with the mouse cursor while a small bar beside the region
+shows the elapsed time with Stop and Cancel buttons. Running gifsnap again
+(the shortcut) while it records stops and saves. `gifsnap --settings` opens
+the settings window.
+
+slop picks the region, ffmpeg captures and encodes, and GTK 3 draws the
+bar, the red border and the settings window. X11 only.
+"""
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+APP = "gifsnap"
+APP_TITLE = "GIF Snap"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP / "config.json"
+PIDFILE = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / f"{APP}.pid"
+BORDER_PX = 2
+RED = "#ff3b30"
+
+
+def default_output_dir():
+    try:
+        pictures = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
+                                  text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pictures = ""
+    return str(Path(pictures or Path.home() / "Pictures") / "GIFs")
+
+
+DEFAULTS = {
+    "fps": 15,
+    "max_width": 0,
+    "start_delay": 0,
+    "max_seconds": 60,
+    "show_cursor": True,
+    "show_border": True,
+    "copy_to_clipboard": True,
+    "open_after": False,
+    "output_dir": "",
+    "hotkey": "<Shift>Print",
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        saved = json.loads(CONFIG_PATH.read_text())
+        cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    if not cfg["output_dir"]:
+        cfg["output_dir"] = default_output_dir()
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def notify(title, body="", icon="camera-video", urgency="normal", actions=(), wait=False):
+    """Show a desktop notification; with wait=True return the Popen so the caller can read the chosen action."""
+    cmd = ["notify-send", "-a", APP_TITLE, "-u", urgency, "-i", icon]
+    cmd += [f"--action={key}={label}" for key, label in actions]
+    if wait:
+        cmd.append("--wait")
+    cmd += [title, body]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE if wait else subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    if not wait:
+        proc.wait()
+    return proc
+
+
+def launch(cmd):
+    """Start a program detached from gifsnap so it outlives it."""
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def show_in_folder(path):
+    """Open the file manager on the GIF's folder with the GIF selected, or just the folder."""
+    uri = Path(path).as_uri()
+    shown = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1",
+         "--object-path", "/org/freedesktop/FileManager1",
+         "--method", "org.freedesktop.FileManager1.ShowItems", f"['{uri}']", ""],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if shown.returncode != 0:
+        launch(["xdg-open", str(Path(path).parent)])
+
+
+def copy_file_to_clipboard(path):
+    """Put the GIF on the clipboard as a file, the way a file manager copy does, so Ctrl+V pastes the file."""
+    uri = "file://" + quote(str(path)) + "\r\n"
+    try:
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", "text/uri-list", "-i"],
+                       input=uri.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       start_new_session=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+# ---------------------------------------------------------------- single instance
+
+def poke_running_instance():
+    """Tell a gifsnap that is already recording to stop. Returns True when there was one."""
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+    if pid == os.getpid() or APP.encode() not in cmdline:
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return False
+    return True
+
+
+def claim_pidfile():
+    PIDFILE.parent.mkdir(parents=True, exist_ok=True)
+    PIDFILE.write_text(str(os.getpid()))
+
+
+def release_pidfile():
+    try:
+        if PIDFILE.read_text().strip() == str(os.getpid()):
+            PIDFILE.unlink()
+    except OSError:
+        pass
+
+
+def pick_region():
+    """Let the user drag a rectangle or click a window. Returns (x, y, w, h), or None if cancelled."""
+    try:
+        out = subprocess.run(["slop", "--noopengl", "-b", str(BORDER_PX), "-c", "1,0.23,0.19,1",
+                              "-f", "%x %y %w %h"], capture_output=True, text=True)
+    except FileNotFoundError:
+        notify(f"{APP_TITLE}: slop is missing", "Install it with: sudo apt install slop",
+               icon="dialog-error", urgency="critical")
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        x, y, w, h = (int(v) for v in out.stdout.split())
+    except ValueError:
+        return None
+    return (x, y, w, h) if w >= 2 and h >= 2 else None
+
+
+# ---------------------------------------------------------------- recording
+
+def record():
+    if poke_running_instance():
+        return
+    if not shutil.which("ffmpeg"):
+        notify(f"{APP_TITLE}: ffmpeg is missing", "Install it with: sudo apt install ffmpeg",
+               icon="dialog-error", urgency="critical")
+        return
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    claim_pidfile()
+    try:
+        region = pick_region()
+        if region is not None:
+            Recorder(load_config(), region).run()
+    finally:
+        release_pidfile()
+
+
+def import_gtk():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+    return Gdk, Gio, GLib, Gtk
+
+
+CSS = f"""
+.gifsnap-border {{ background-color: {RED}; }}
+.gifsnap-win {{ background-color: transparent; }}
+.gifsnap-win.opaque {{ background-color: #1e1e22; }}
+.gifsnap-bar {{ background-color: #1e1e22; border: 1px solid #44444b; border-radius: 9px; padding: 5px 6px 5px 10px; }}
+.gifsnap-bar label {{ color: #f2f2f2; }}
+.gifsnap-bar .dot {{ color: {RED}; }}
+.gifsnap-bar .time {{ font-family: monospace; font-weight: bold; }}
+.gifsnap-bar button {{ min-height: 0; min-width: 0; padding: 2px 10px; border-radius: 6px;
+    border: none; box-shadow: none; background-image: none; text-shadow: none; }}
+.gifsnap-bar button.stop {{ background-color: {RED}; }}
+.gifsnap-bar button.stop:hover {{ background-color: #ff6259; }}
+.gifsnap-bar button.stop label {{ color: #ffffff; font-weight: bold; }}
+.gifsnap-bar button.cancel {{ background-color: #3a3a40; }}
+.gifsnap-bar button.cancel:hover {{ background-color: #57575f; }}
+.gifsnap-bar button.cancel label {{ color: #dddddd; }}
+"""
+
+
+class Recorder:
+    """One recording, start to finish: border and control bar, countdown, ffmpeg capture, GIF encode, save."""
+
+    def __init__(self, cfg, region):
+        self.Gdk, self.Gio, self.GLib, self.Gtk = import_gtk()
+        self.cfg = cfg
+        self.region = self.clamp_to_screen(region)
+        self.tmp = Path(tempfile.mkdtemp(prefix=f"{APP}-"))
+        self.raw = self.tmp / "capture.mkv"
+        self.palette = self.tmp / "palette.png"
+        self.gif = self.tmp / "out.gif"
+        self.log = self.tmp / "ffmpeg.log"
+        self.proc = None
+        self.on_proc_exit = None
+        self.state = "idle"
+        self.started = 0.0
+        self.duration = 0.0
+        self.countdown_left = 0
+        self.timers = []
+        self.borders = []
+
+    # -- setup
+
+    def clamp_to_screen(self, region):
+        root = self.Gdk.get_default_root_window()
+        _, _, sw, sh = root.get_geometry()
+        x, y, w, h = region
+        x, y = max(0, x), max(0, y)
+        return x, y, max(2, min(w, sw - x)), max(2, min(h, sh - y))
+
+    def run(self):
+        Gtk, GLib = self.Gtk, self.GLib
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_screen(self.Gdk.Screen.get_default(), provider,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if self.cfg["show_border"]:
+            self.build_border()
+        self.build_bar()
+        for sig, handler in ((signal.SIGUSR1, self.on_hotkey), (signal.SIGTERM, self.on_term),
+                             (signal.SIGINT, self.on_term)):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, handler)
+        delay = int(self.cfg["start_delay"])
+        if delay > 0:
+            self.start_countdown(delay)
+        else:
+            self.start_capture()
+        try:
+            Gtk.main()
+        finally:
+            self.kill_proc()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def popup(self):
+        win = self.Gtk.Window(type=self.Gtk.WindowType.POPUP)
+        win.set_accept_focus(False)
+        return win
+
+    def build_border(self):
+        x, y, w, h = self.region
+        b = BORDER_PX
+        for bx, by, bw, bh in ((x - b, y - b, w + 2 * b, b), (x - b, y + h, w + 2 * b, b),
+                               (x - b, y, b, h), (x + w, y, b, h)):
+            win = self.popup()
+            win.get_style_context().add_class("gifsnap-border")
+            win.set_default_size(bw, bh)
+            win.move(bx, by)
+            win.show()
+            self.borders.append(win)
+
+    def build_bar(self):
+        Gtk = self.Gtk
+        self.bar = self.popup()
+        screen = self.bar.get_screen()
+        visual = screen.get_rgba_visual()
+        ctx = self.bar.get_style_context()
+        ctx.add_class("gifsnap-win")
+        if visual is not None and screen.is_composited():
+            self.bar.set_visual(visual)
+            self.bar.set_app_paintable(True)
+        else:
+            ctx.add_class("opaque")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.get_style_context().add_class("gifsnap-bar")
+        self.dot = Gtk.Label(label="●")
+        self.dot.get_style_context().add_class("dot")
+        self.time_label = Gtk.Label(label="0:00")
+        self.time_label.get_style_context().add_class("time")
+        self.stop_btn = Gtk.Button(label="■  Stop")
+        self.stop_btn.get_style_context().add_class("stop")
+        self.stop_btn.set_tooltip_text("Stop and save the GIF (or press the shortcut again)")
+        self.stop_btn.connect("clicked", lambda *_: self.stop())
+        cancel_btn = Gtk.Button(label="✕")
+        cancel_btn.get_style_context().add_class("cancel")
+        cancel_btn.set_tooltip_text("Cancel and throw it away")
+        cancel_btn.connect("clicked", lambda *_: self.cancel())
+        for widget in (self.dot, self.time_label, self.stop_btn, cancel_btn):
+            box.pack_start(widget, False, False, 0)
+        self.bar.add(box)
+        box.show_all()
+
+    def show_bar(self, text, recording):
+        self.time_label.set_text(text)
+        self.stop_btn.set_visible(recording)
+        self.dot.set_visible(recording)
+        self.dot.set_opacity(1.0)
+        self.place_bar()
+        self.bar.show()
+
+    def place_bar(self):
+        """Put the bar just outside the region (below, above, right, left, another monitor), never over it if avoidable."""
+        size = self.bar.get_child().get_preferred_size()[1]
+        bw, bh = size.width, size.height
+        x, y, w, h = self.region
+        gap = BORDER_PX + 6
+        display = self.Gdk.Display.get_default()
+        monitors = [display.get_monitor(i).get_geometry() for i in range(display.get_n_monitors())]
+        home = display.get_monitor_at_point(x + w // 2, y + h // 2).get_geometry()
+
+        def clamp_x(cx, mon):
+            return min(max(cx, mon.x), mon.x + mon.width - bw)
+
+        candidates = [
+            (clamp_x(x + w - bw, home), y + h + gap),
+            (clamp_x(x + w - bw, home), y - bh - gap),
+            (x + w + gap, y + h - bh),
+            (x - bw - gap, y + h - bh),
+        ]
+        candidates += [(m.x + (m.width - bw) // 2, m.y + m.height - bh - 60) for m in monitors]
+
+        def inside_a_monitor(cx, cy):
+            return any(m.x <= cx and m.y <= cy and cx + bw <= m.x + m.width and cy + bh <= m.y + m.height
+                       for m in monitors)
+
+        def clear_of_region(cx, cy):
+            return (cx + bw <= x - BORDER_PX or cx >= x + w + BORDER_PX or
+                    cy + bh <= y - BORDER_PX or cy >= y + h + BORDER_PX)
+
+        for cx, cy in candidates:
+            if inside_a_monitor(cx, cy) and clear_of_region(cx, cy):
+                break
+        else:
+            cx, cy = x + w - bw - 8, y + h - bh - 8
+        self.bar.resize(bw, bh)
+        self.bar.move(int(cx), int(cy))
+
+    # -- child processes
+
+    def spawn(self, cmd, on_exit, stdin=None):
+        with open(self.log, "ab") as log:
+            self.proc = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.DEVNULL, stderr=log)
+        self.on_proc_exit = on_exit
+        self.add_timer(100, self.watch_proc)
+
+    def watch_proc(self):
+        if self.proc is None:
+            return False
+        code = self.proc.poll()
+        if code is None:
+            return True
+        self.proc = None
+        callback, self.on_proc_exit = self.on_proc_exit, None
+        if callback:
+            callback(code)
+        return False
+
+    def kill_proc(self):
+        proc, self.proc = self.proc, None
+        self.on_proc_exit = None
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def add_timer(self, ms, fn):
+        def tick():
+            keep = fn()
+            if not keep and tid in self.timers:
+                self.timers.remove(tid)
+            return keep
+        tid = self.GLib.timeout_add(ms, tick)
+        self.timers.append(tid)
+        return tid
+
+    def clear_timers(self):
+        for tid in self.timers:
+            self.GLib.source_remove(tid)
+        self.timers.clear()
+
+    # -- states
+
+    def start_countdown(self, seconds):
+        self.state = "countdown"
+        self.countdown_left = seconds
+        self.show_bar(f"Starts in {seconds}", recording=False)
+
+        def tick():
+            if self.state != "countdown":
+                return False
+            self.countdown_left -= 1
+            if self.countdown_left <= 0:
+                self.start_capture()
+                return False
+            self.time_label.set_text(f"Starts in {self.countdown_left}")
+            return True
+        self.add_timer(1000, tick)
+
+    def start_capture(self):
+        x, y, w, h = self.region
+        fps = max(1, int(self.cfg["fps"]))
+        display = os.environ.get("DISPLAY", ":0")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "x11grab", "-draw_mouse", "1" if self.cfg["show_cursor"] else "0",
+               "-framerate", str(fps), "-video_size", f"{w}x{h}", "-i", f"{display}+{x},{y}",
+               "-c:v", "libx264rgb", "-preset", "ultrafast", "-crf", "0", str(self.raw)]
+        self.state = "recording"
+        self.spawn(cmd, self.capture_ended, stdin=subprocess.PIPE)
+        self.started = time.monotonic()
+        self.show_bar("0:00", recording=True)
+        self.add_timer(250, self.recording_tick)
+
+    def recording_tick(self):
+        if self.state != "recording":
+            return False
+        elapsed = time.monotonic() - self.started
+        self.time_label.set_text(f"{int(elapsed) // 60}:{int(elapsed) % 60:02d}")
+        self.dot.set_opacity(1.0 if int(elapsed * 2) % 2 == 0 else 0.25)
+        limit = int(self.cfg["max_seconds"])
+        if limit > 0 and elapsed >= limit:
+            self.stop()
+            return False
+        return True
+
+    def stop(self):
+        if self.state == "countdown":
+            self.cancel()
+            return
+        if self.state != "recording":
+            return
+        self.state = "finishing"
+        self.duration = time.monotonic() - self.started
+        for win in self.borders:
+            win.hide()
+        self.show_bar("Saving…", recording=False)
+        try:
+            self.proc.stdin.write(b"q")
+            self.proc.stdin.close()
+        except (OSError, AttributeError):
+            pass
+        proc = self.proc
+
+        def force():
+            if proc.poll() is None:
+                proc.terminate()
+            return False
+        self.add_timer(5000, force)
+
+    def capture_ended(self, code):
+        if self.state == "recording":
+            self.fail("Recording stopped by itself")
+            return
+        if not self.raw.exists() or self.raw.stat().st_size == 0:
+            self.fail("Nothing was recorded (too short?)")
+            return
+        self.state = "encoding"
+        self.time_label.set_text("Encoding…")
+        x, y, w, h = self.region
+        fps = max(1, int(self.cfg["fps"]))
+        vf = f"fps={fps}"
+        max_width = int(self.cfg["max_width"])
+        if max_width > 0 and w > max_width:
+            vf += f",scale={max_width}:-1:flags=lanczos"
+        self.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(self.raw),
+                    "-vf", f"{vf},palettegen", str(self.palette)],
+                   lambda c: self.palette_done(c, vf))
+
+    def palette_done(self, code, vf):
+        if code != 0 or not self.palette.exists():
+            self.fail("Encoding failed (palette)")
+            return
+        self.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(self.raw),
+                    "-i", str(self.palette), "-lavfi",
+                    f"{vf}[v];[v][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                    "-loop", "0", str(self.gif)],
+                   self.gif_done)
+
+    def gif_done(self, code):
+        if code != 0 or not self.gif.exists():
+            self.fail("Encoding failed (gif)")
+            return
+        out_dir = Path(os.path.expanduser(self.cfg["output_dir"]))
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            final = out_dir / f"gif-{time.strftime('%Y-%m-%d_%H-%M-%S')}.gif"
+            shutil.move(str(self.gif), final)
+        except OSError as e:
+            self.fail(f"Could not save to {out_dir}: {e.strerror}")
+            return
+        self.state = "done"
+        release_pidfile()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.bar.hide()
+        copied = self.cfg["copy_to_clipboard"] and copy_file_to_clipboard(final)
+        if self.cfg["open_after"]:
+            launch(["xdg-open", str(final)])
+        body = f"{final.name}  ·  {human_size(final.stat().st_size)}  ·  {self.duration:.1f}s"
+        if copied:
+            body += "\nCopied to clipboard: paste it anywhere"
+        print(final, flush=True)
+        self.notify_saved(final, body)
+
+    def notify_saved(self, final, body):
+        """Show the 'saved' notification and act on its buttons, then exit."""
+        proc = notify("GIF saved", body, icon=str(final),
+                      actions=(("open", "Open"), ("folder", "Show in folder")), wait=True)
+        if proc is None:
+            self.quit()
+            return
+        deadline = time.monotonic() + 120
+
+        def check():
+            if proc.poll() is None:
+                if time.monotonic() < deadline:
+                    return True
+                proc.kill()
+            choice = (proc.stdout.read() or "").strip() if proc.stdout else ""
+            if choice == "open":
+                launch(["xdg-open", str(final)])
+            elif choice == "folder":
+                show_in_folder(final)
+            self.quit()
+            return False
+        self.add_timer(200, check)
+
+    def cancel(self):
+        if self.state in ("done", "cancelled"):
+            return
+        self.state = "cancelled"
+        self.kill_proc()
+        self.quit()
+
+    def fail(self, message):
+        self.state = "failed"
+        self.kill_proc()
+        detail = ""
+        try:
+            detail = self.log.read_text(errors="replace").strip().splitlines()[-1]
+        except (OSError, IndexError):
+            pass
+        print(f"{APP}: {message}: {detail}", file=sys.stderr)
+        notify(f"{APP_TITLE}: {message}", detail, icon="dialog-error", urgency="critical")
+        self.quit()
+
+    def quit(self):
+        self.clear_timers()
+        for win in self.borders + [self.bar]:
+            win.hide()
+        self.Gtk.main_quit()
+
+    # -- signals
+
+    def on_hotkey(self):
+        self.stop()
+        return True
+
+    def on_term(self):
+        self.cancel()
+        return True
+
+
+# ---------------------------------------------------------------- settings and shortcut
+
+KEYBINDINGS = "org.cinnamon.desktop.keybindings"
+CUSTOM_SCHEMA = "org.cinnamon.desktop.keybindings.custom-keybinding"
+CUSTOM_PATH = "/org/cinnamon/desktop/keybindings/custom-keybindings/{}/"
+
+
+def own_command():
+    installed = Path.home() / ".local" / "bin" / APP
+    return str(installed if installed.exists() else Path(sys.argv[0]).resolve())
+
+
+def apply_hotkey(accel, Gio):
+    """Create or update the Cinnamon custom shortcut that runs gifsnap. Returns an error message or None."""
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup(KEYBINDINGS, True) is None:
+        return "Cinnamon keyboard shortcuts were not found; bind gifsnap to a key yourself."
+    keybindings = Gio.Settings.new(KEYBINDINGS)
+    names = list(keybindings.get_strv("custom-list"))
+
+    def entry(name):
+        return Gio.Settings.new_with_path(CUSTOM_SCHEMA, CUSTOM_PATH.format(name))
+
+    target = next((n for n in names if APP in entry(n).get_string("command")
+                   and "--settings" not in entry(n).get_string("command")), None)
+    if target is None:
+        i = 0
+        while f"custom{i}" in names:
+            i += 1
+        target = f"custom{i}"
+    settings = entry(target)
+    settings.set_string("name", APP_TITLE)
+    settings.set_string("command", own_command())
+    settings.set_strv("binding", [accel] if accel else [])
+    if target not in names:
+        keybindings.set_strv("custom-list", names + [target])
+    Gio.Settings.sync()
+    return None
+
+
+def install_hotkey():
+    _, Gio, _, _ = import_gtk()
+    error = apply_hotkey(load_config()["hotkey"], Gio)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    print(f"Shortcut set: {load_config()['hotkey']} runs {own_command()}")
+    return 0
+
+
+def accel_label(accel, Gtk):
+    if not accel:
+        return "None"
+    key, mods = Gtk.accelerator_parse(accel)
+    return Gtk.accelerator_get_label(key, mods) if key else accel
+
+
+def settings_window():
+    Gdk, Gio, GLib, Gtk = import_gtk()
+    cfg = load_config()
+    win = Gtk.Window(title=f"{APP_TITLE} settings")
+    win.set_border_width(16)
+    win.set_resizable(False)
+    win.set_icon_name("camera-video")
+    win.connect("destroy", Gtk.main_quit)
+
+    grid = Gtk.Grid(row_spacing=10, column_spacing=14)
+    rows = []
+
+    def add_row(label, widget, hint=""):
+        lbl = Gtk.Label(label=label, xalign=0)
+        grid.attach(lbl, 0, len(rows), 1, 1)
+        holder = Gtk.Box(spacing=8)
+        holder.pack_start(widget, False, False, 0)
+        if hint:
+            h = Gtk.Label(label=hint, xalign=0)
+            h.get_style_context().add_class("dim-label")
+            holder.pack_start(h, False, False, 0)
+        grid.attach(holder, 1, len(rows), 1, 1)
+        rows.append(widget)
+
+    def spin(value, low, high, step):
+        s = Gtk.SpinButton.new_with_range(low, high, step)
+        s.set_value(value)
+        return s
+
+    def switch(value):
+        s = Gtk.Switch(active=bool(value))
+        s.set_halign(Gtk.Align.START)
+        return s
+
+    fps = spin(cfg["fps"], 1, 60, 1)
+    max_width = spin(cfg["max_width"], 0, 7680, 10)
+    delay = spin(cfg["start_delay"], 0, 30, 1)
+    max_seconds = spin(cfg["max_seconds"], 0, 3600, 5)
+    cursor = switch(cfg["show_cursor"])
+    border = switch(cfg["show_border"])
+    clipboard = switch(cfg["copy_to_clipboard"])
+    open_after = switch(cfg["open_after"])
+    folder = Gtk.FileChooserButton(title="Save GIFs to", action=Gtk.FileChooserAction.SELECT_FOLDER)
+    out_dir = Path(os.path.expanduser(cfg["output_dir"]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    folder.set_filename(str(out_dir))
+    folder.set_size_request(220, -1)
+
+    MODIFIER_KEYS = {getattr(Gdk, f"KEY_{n}") for n in (
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
+        "Meta_L", "Meta_R", "Hyper_L", "Hyper_R", "ISO_Level3_Shift", "Caps_Lock", "Num_Lock")}
+    state = {"hotkey": cfg["hotkey"], "capturing": False}
+    shortcut = Gtk.Button(label=accel_label(state["hotkey"], Gtk))
+    shortcut.set_size_request(220, -1)
+    shortcut.set_tooltip_text("Click, then press the new shortcut. Esc cancels, Backspace clears.")
+    seat = Gdk.Display.get_default().get_default_seat()
+
+    def end_capture():
+        state["capturing"] = False
+        seat.ungrab()
+        shortcut.set_label(accel_label(state["hotkey"], Gtk))
+
+    def on_shortcut_clicked(_btn):
+        if state["capturing"]:
+            return
+        state["capturing"] = True
+        shortcut.set_label("Press a shortcut…")
+        # An active keyboard grab beats the desktop's own shortcuts, so even Print reaches us.
+        seat.grab(win.get_window(), Gdk.SeatCapabilities.KEYBOARD, False, None, None, None, None)
+
+    def on_key(_w, event):
+        if not state["capturing"]:
+            return False
+        keyval = Gdk.keyval_to_lower(event.keyval)
+        if keyval in MODIFIER_KEYS:
+            return True
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+        if keyval == Gdk.KEY_Escape and not mods:
+            pass
+        elif keyval == Gdk.KEY_BackSpace and not mods:
+            state["hotkey"] = ""
+        else:
+            state["hotkey"] = Gtk.accelerator_name(keyval, mods)
+        end_capture()
+        return True
+
+    shortcut.connect("clicked", on_shortcut_clicked)
+    win.connect("key-press-event", on_key)
+
+    add_row("Shortcut", shortcut, "press again to stop")
+    add_row("Frame rate", fps, "fps")
+    add_row("Max width", max_width, "px, 0 = full size")
+    add_row("Start delay", delay, "seconds")
+    add_row("Stop after", max_seconds, "seconds, 0 = no limit")
+    add_row("Record cursor", cursor)
+    add_row("Red border while recording", border)
+    add_row("Copy GIF to clipboard", clipboard)
+    add_row("Open GIF after saving", open_after)
+    add_row("Save to", folder)
+
+    status = Gtk.Label(xalign=0)
+    status.get_style_context().add_class("dim-label")
+    buttons = Gtk.Box(spacing=8)
+    cancel = Gtk.Button(label="Cancel")
+    cancel.connect("clicked", lambda *_: win.destroy())
+    save = Gtk.Button(label="Save")
+    save.get_style_context().add_class("suggested-action")
+
+    def on_save(_btn):
+        old_hotkey = cfg["hotkey"]
+        cfg.update({
+            "fps": fps.get_value_as_int(), "max_width": max_width.get_value_as_int(),
+            "start_delay": delay.get_value_as_int(), "max_seconds": max_seconds.get_value_as_int(),
+            "show_cursor": cursor.get_active(), "show_border": border.get_active(),
+            "copy_to_clipboard": clipboard.get_active(), "open_after": open_after.get_active(),
+            "output_dir": folder.get_filename() or cfg["output_dir"], "hotkey": state["hotkey"],
+        })
+        save_config(cfg)
+        error = apply_hotkey(cfg["hotkey"], Gio) if cfg["hotkey"] != old_hotkey else None
+        if error:
+            status.set_text(error)
+            return
+        win.destroy()
+
+    save.connect("clicked", on_save)
+    buttons.pack_start(status, True, True, 0)
+    buttons.pack_end(save, False, False, 0)
+    buttons.pack_end(cancel, False, False, 0)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+    outer.pack_start(grid, False, False, 0)
+    outer.pack_start(buttons, False, False, 0)
+    win.add(outer)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog=APP, description="Record a screen region to a GIF.")
+    parser.add_argument("--settings", action="store_true", help="open the settings window")
+    parser.add_argument("--install-hotkey", action="store_true",
+                        help="bind the configured shortcut in Cinnamon")
+    args = parser.parse_args()
+    if args.settings:
+        return settings_window()
+    if args.install_hotkey:
+        return install_hotkey()
+    record()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
