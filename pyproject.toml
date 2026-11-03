@@ -1,0 +1,24 @@
+[project]
+name = "jiffy"
+dynamic = ["version"]
+description = "Press a shortcut, drag a region, get a GIF. A screen-to-GIF recorder for Linux (X11)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+[project.scripts]
+jiffy = "jiffy.__main__:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "SIM"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["e2e: drives the real app on a virtual X display (needs Xvfb, ffmpeg, xdotool)"]
+addopts = "-m 'not e2e'"

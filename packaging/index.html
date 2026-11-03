@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jiffy: press a shortcut, drag a region, get a GIF</title>
+<link rel="icon" href="icon.svg">
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 680px; margin: 60px auto; padding: 0 20px; color: #1d1d1f; }
+  h1 { display: flex; align-items: center; gap: 14px; margin-bottom: 4px; }
+  h1 img { width: 48px; height: 48px; }
+  .tag { color: #6e6e73; margin-top: 0; }
+  pre { background: #1e1e22; color: #f2f2f2; padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
+  code { font-family: ui-monospace, monospace; font-size: 14px; }
+  li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1><img src="icon.svg" alt="">Jiffy</h1>
+<p class="tag">Press a shortcut, drag a region, get a GIF. For Linux desktops on X11 (Mint, Ubuntu, Debian). Version @VERSION@.</p>
+<h2>Install</h2>
+<pre><code>curl -fsSL https://wh1t3-r0s3.github.io/jiffy/install.sh | bash</code></pre>
+<p>Updates arrive with your normal system updates.</p>
+<h2>Use</h2>
+<ul>
+  <li>Press the shortcut (the installer tells you which, usually <b>Shift+Print</b>).</li>
+  <li>Drag a region, click a window, or press Space for the whole screen. Esc cancels.</li>
+  <li>Press the shortcut again (or Stop) to finish. The GIF is saved and copied, so Ctrl+V pastes it.</li>
+  <li>Settings: run <code>jiffy settings</code> or open <i>Jiffy Settings</i> from the menu.</li>
+</ul>
+<p><a href="https://github.com/wh1t3-r0s3/jiffy">Source on GitHub</a></p>
+</body>
+</html>

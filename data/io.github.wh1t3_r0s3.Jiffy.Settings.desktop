@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Jiffy Settings
+Comment=Shortcut, quality and where recordings are saved
+Exec=jiffy settings
+Icon=io.github.wh1t3_r0s3.Jiffy
+Terminal=false
+StartupNotify=false
+Categories=Settings;Utility;
+Keywords=gif;screen;record;shortcut;

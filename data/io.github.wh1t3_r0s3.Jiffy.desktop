@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Jiffy
+GenericName=GIF Recorder
+Comment=Record a region of the screen to a GIF
+Exec=jiffy record
+Icon=io.github.wh1t3_r0s3.Jiffy
+Terminal=false
+StartupNotify=false
+Categories=Utility;Graphics;
+Keywords=gif;screen;record;recorder;capture;screencast;clip;
+Actions=settings;
+
+[Desktop Action settings]
+Name=Settings
+Exec=jiffy settings

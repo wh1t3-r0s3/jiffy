@@ -1,0 +1,57 @@
+name: Release
+
+# Pushing a tag like v1.2.0 tests that commit, publishes the package as a GitHub release,
+# and updates the apt repository on GitHub Pages, from which installed copies update themselves.
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag matches the version in the code
+        run: |
+          version=$(PYTHONPATH=src python3 -c 'import jiffy; print(jiffy.__version__)')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $version"
+            exit 1
+          fi
+      - name: Build the package
+        run: packaging/build-deb.sh
+      - name: Build the apt repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: packaging/build-site.sh site dist/jiffy_*_all.deb
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/jiffy_*_all.deb --title "Jiffy ${GITHUB_REF_NAME#v}" --generate-notes
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  pages:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
+      - id: deploy
+        uses: actions/deploy-pages@v5

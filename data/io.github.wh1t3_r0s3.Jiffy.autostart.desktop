@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Jiffy
+Comment=Keeps Jiffy ready so its shortcut responds instantly
+Exec=jiffy --background
+Icon=io.github.wh1t3_r0s3.Jiffy
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

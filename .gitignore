@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+dist/
+site/
+.pytest_cache/
+.ruff_cache/
