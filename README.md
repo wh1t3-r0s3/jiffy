@@ -80,7 +80,7 @@ python3 -m pytest -q                       # unit tests
 python3 -m pytest -q -m e2e tests/e2e      # drives the real app on a virtual X display
 ```
 
-The end-to-end tests run on their own virtual display and private session bus, so they never touch your desktop.
+Every test run gets its own virtual X display (and the end-to-end tests a private session bus too), so tests never touch your desktop.
 
 ### How it fits together
 
